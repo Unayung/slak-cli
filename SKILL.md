@@ -103,6 +103,13 @@ so `--once` from a systemd timer or cron only ever prints new ones. Delete that
 file to replay the window. Your own messages are dropped; the rest of the filter
 lives in `worth_alerting()` in the script.
 
+A hit with a nidin group link (`order.nidin.shop/gb/menu/...`) gets a `nidin`
+field: brand, store, opener, `store_id`, `group_buying_status` (20 = closed).
+The data comes from nidin's public brief endpoint, so no nidin login is needed.
+To see the menu or join, hand the link to the `nidin` CLI:
+`nidin group peek <link>`, `nidin group join <link> <product_id>`, and, after
+the user confirms, `nidin group send <order_id> --yes`.
+
 ## Gotchas
 
 - Scheduling goes through Slack's draft API (`chat.scheduleMessage` rejects

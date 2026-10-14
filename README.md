@@ -93,6 +93,11 @@ walking channel history. Messages already reported are remembered in
 `~/.config/slak/seen-<TEAM>.json`. Delete that file to replay the window. Your
 own messages are skipped. Edit `worth_alerting()` in the script for more filtering.
 
+Hits with a nidin group link also show the store and who opened the group,
+read from nidin's public group summary. With
+[nidin-cli](https://github.com/Unayung/nidin-cli) installed, the printed
+`nidin group peek <link>` shows the menu and `nidin group join` orders from it.
+
 ### For scripts and agents
 
 ```json
@@ -203,6 +208,8 @@ slak watch --interval 300                  # 每 5 分鐘查一次，有新訊�
 ```
 
 每個關鍵字只打一次搜尋 API，所以頻道再多也不會一個個翻歷史訊息。已經回報過的訊息記在 `~/.config/slak/seen-<TEAM>.json`，刪掉這個檔就會重新回報觀察期間內的訊息。你自己發的訊息會被略過，其他過濾條件可以改程式裡的 `worth_alerting()`。
+
+抓到你訂團購連結時，會另外顯示是哪家店、誰開的團，資料來自你訂公開的團購摘要，不用登入你訂。有裝 [nidin-cli](https://github.com/Unayung/nidin-cli) 的話，照著印出來的 `nidin group peek <連結>` 就能看菜單，用 `nidin group join` 可以直接跟團點餐。
 
 Uber Eats 的團購連結有 `ubereats.com` 和 `eats.uber.com` 兩種網域，兩個都已經放進預設關鍵字。
 

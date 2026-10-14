@@ -16,6 +16,10 @@ assert slak.thread_of(P) == "1700000000.123456"
 assert slak.thread_of(P + "?thread_ts=1699999999.000100") == "1699999999.000100"
 assert slak.thread_of("1700000000.000001") == "1700000000.000001"
 
+m = slak.NIDIN_GB.search("團 https://order.nidin.shop/gb/menu/485/bVHIGz6q-R 快來")
+assert (m[1], m[2]) == ("485", "bVHIGz6q-R")
+assert slak.nidin_group("no link here") is None
+
 import datetime as dt
 assert slak.parse_duration("30m") == 1800 and slak.parse_duration("2h") == 7200
 assert slak.parse_duration("90") == 5400 and slak.parse_duration("1.5d") == 129600

@@ -856,6 +856,35 @@ def worth_alerting(hit, me):
     return hit["user_id"] != me
 
 
+NIDIN_GB = re.compile(r"https?://order\.nidin\.shop/gb/menu/(\d+)/([\w-]+)")
+
+
+def nidin_group(text):
+    """Store and opener behind a nidin group-buy link. Anonymous read, None on any failure."""
+    m = NIDIN_GB.search(text or "")
+    if not m:
+        return None
+    req = urllib.request.Request(
+        f"https://loctw-service-api.nidin.shop/shopper/v2/groupBuy/{m[2]}/brief",
+        headers={"Accept": "application/json", "Origin": "https://order.nidin.shop"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            b = json.load(resp)["group_buy_brief"]
+    except Exception:  # ponytail: enrichment is best-effort, the link is still shown
+        return None
+    return {"url": m[0], "store_id": b.get("store_id"), "brand": b.get("brand_name"),
+            "store": b.get("store_name"), "opener": b.get("group_buying_name"),
+            "group_buying_status": b.get("group_buying_status")}
+
+
+def fmt_hit(h):
+    out = f"[{h['keyword']}] " + render([h])
+    if h.get("nidin"):
+        n = h["nidin"]
+        out += f"\n    {n['brand']} {n['store']} · {n['opener']}  (nidin group peek {n['url']})"
+    return out + f"\n    {h.get('permalink', '')}"
+
+
 def scan(c, keywords, since_days, seen, me):
     """One pass: search each keyword, keep literal matches newer than the window."""
     cutoff = time.time() - since_days * 86400
@@ -873,6 +902,7 @@ def scan(c, keywords, since_days, seen, me):
             hit.update(keyword=kw, user_id=m.get("user"))
             seen[key] = float(m["ts"])
             if worth_alerting(hit, me):
+                hit["nidin"] = nidin_group(hit["text"])
                 hits.append(hit)
     hits.sort(key=lambda h: float(h["ts"]))
     return hits
@@ -888,13 +918,10 @@ def cmd_watch(args, c):
         horizon = time.time() - (args.since + 7) * 86400
         _write_json(seen_path, {k: v for k, v in seen.items() if v >= horizon})
         if args.once:
-            emit(args, hits, lambda: "\n".join(
-                f"[{h['keyword']}] " + render([h]) + f"\n    {h.get('permalink', '')}"
-                for h in hits) or "(no new hits)")
+            emit(args, hits, lambda: "\n".join(map(fmt_hit, hits)) or "(no new hits)")
             return EX_OK
         for h in hits:
-            print(json.dumps(h, ensure_ascii=False) if args.json else
-                  f"[{h['keyword']}] " + render([h]) + f"\n    {h.get('permalink', '')}", flush=True)
+            print(json.dumps(h, ensure_ascii=False) if args.json else fmt_hit(h), flush=True)
         time.sleep(args.interval)
 
 
