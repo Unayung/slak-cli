@@ -1,6 +1,6 @@
 ---
 name: slak
-description: Read and write Slack from the command line as the user's own account - list channels, see what's unread, read channels/DMs/threads (paste a permalink), search messages, send messages and thread replies, find people, and watch every channel for keywords (飲料, 請客, nidin / Uber Eats group-order links). Use whenever the user wants to check, search, monitor, or post in Slack from a shell.
+description: Read and write Slack from the command line as the user's own account - unread overview, read channels/DMs/threads (paste a permalink), search, mentions, send / schedule / edit / delete / react, upload and download files, mark read, set status and do-not-disturb, export a channel to Markdown, and watch every channel for keywords (飲料, 請客, nidin / Uber Eats group-order links). Use whenever the user wants to check, search, monitor, or act in Slack from a shell.
 ---
 
 # slak
@@ -52,7 +52,10 @@ slak read random -n 30             # channel by name, '#name', id, or '@user' fo
 slak read <permalink>              # a message link opens its thread
 slak thread <permalink>            # or: slak thread <channel> <ts>
 slak search '"關鍵字" in:#random after:2026-10-01' -n 20
+slak mentions -n 20                # messages that @-mention the user
 slak users erica                   # cached; --refresh after new hires
+slak download <permalink> -o DIR   # files attached to a message (never overwrites)
+slak export random --since 7 --threads   # Markdown transcript; --json for records
 ```
 
 Messages come back oldest-first as `{ts, time, user, text, replies?, thread_ts?, files?}`.
@@ -68,7 +71,23 @@ echo "multi-line" | slak send random -
 ```
 
 Returns `{channel, ts, permalink}`. **Confirm the recipient and the text with
-the user before sending.** There is no unsend from this CLI.
+the user before sending.** Keep the returned permalink: it is how you edit,
+react to or delete that message afterwards.
+
+```bash
+slak send random "text" --at 09:00          # schedule: +30m, 09:00 (next), 'YYYY-MM-DD HH:MM'
+slak scheduled [channel]                    # pending scheduled messages, with ids
+slak scheduled --cancel <id>
+slak edit <permalink> "new text"            # your own messages only
+slak delete <permalink> [--files]           # --files also removes attached uploads
+slak react <permalink> plus1 [--remove]
+slak upload random a.png b.pdf -m "caption" [--thread <ts|permalink>]
+slak mark random                            # mark read up to the latest message
+slak status :bento: 午餐中 --for 1h          # or: slak status / slak status --clear
+slak dnd 30m                                # snooze notifications; `slak dnd off`; `slak dnd`
+```
+
+Any message-targeting command also takes `<channel> --ts <ts>` instead of a permalink.
 
 ## Keyword watch
 
@@ -85,6 +104,11 @@ file to replay the window. Your own messages are dropped; the rest of the filter
 lives in `worth_alerting()` in the script.
 
 ## Gotchas
+
+- Scheduling goes through Slack's draft API (`chat.scheduleMessage` rejects
+  session tokens), so scheduled text is sent literally: `*bold*` and `<@U…>`
+  are not rendered.
+- `chat.delete` leaves uploaded files behind; use `delete --files` when cleaning up.
 
 - Slack search segments CJK and fuzzily matches single characters. `watch`
   quotes each keyword and then re-checks the literal text. Quote CJK terms in

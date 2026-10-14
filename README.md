@@ -26,7 +26,13 @@ Zero dependencies. Python 3.8+. Single file. Linux and macOS.
   Paste a message link to open its thread.
 - **Unread overview.** Conversations with unread messages, mentions first.
 - **Search** with full Slack syntax (`in:#channel`, `from:@user`, `after:`…).
-- **Post** to a channel, a DM (`@user`), or a thread reply.
+- **Post** to a channel, a DM (`@user`), or a thread reply. Schedule it for
+  later, then list or cancel it.
+- **Follow up on messages:** edit, delete (optionally with their uploads), react.
+- **Files:** upload to a channel, DM or thread; download a message's attachments.
+- **Mentions** across all channels, and **mark read** when you're done.
+- **Status and Do Not Disturb:** set a status with auto-expiry, snooze notifications.
+- **Export** a channel (with threads) to Markdown or JSON, ready to hand to an LLM.
 - **Keyword watch.** Scans every channel for keywords and reports only messages
   it hasn't shown before. Run it as a one-off from cron or as a foreground loop.
 - **Agent-ready.** Every command takes `--json` with a stable envelope and exit
@@ -57,7 +63,22 @@ slak send random "hello"
 slak send @alice "got a sec?"
 slak send random "on it" --thread <ts or message link>
 echo "multi-line" | slak send random -
+
+slak send random "standup in 5" --at 09:55     # also +30m, 'YYYY-MM-DD HH:MM'
+slak scheduled                                 # list; --cancel <id>
+slak edit <message link> "fixed typo"
+slak delete <message link> --files
+slak react <message link> eyes
+slak upload random report.pdf -m "Q3 numbers"
+slak download <message link> -o ~/Downloads
+slak mentions
+slak mark random
+slak status :bento: lunch --for 1h             # --clear to remove
+slak dnd 30m                                   # dnd off / dnd to check
+slak export random --since 7 --threads > random.md
 ```
+
+Commands that target one message take a message link, or `<channel> --ts <ts>`.
 
 ### Keyword watch
 
@@ -118,7 +139,12 @@ Tests: `python3 test_parse.py`
 - **你加入的對話都讀得到**：公開與私人頻道、私訊、群組私訊。直接貼訊息連結就能打開整串 thread。
 - **未讀總覽**：列出有未讀的對話，被 tag 的排在最前面。
 - **搜尋**：支援完整的 Slack 搜尋語法（`in:#頻道`、`from:@人`、`after:` 等）。
-- **發訊息**：可以發到頻道、私訊（`@人`）或回覆在 thread 裡。
+- **發訊息**：可以發到頻道、私訊（`@人`）或回覆在 thread 裡。也能排程稍後送出，並列出或取消排程。
+- **處理已送出的訊息**：編輯、刪除（可以連附件一起刪）、加表情回應。
+- **檔案**：上傳到頻道、私訊或 thread，下載訊息裡的附件。
+- **被 tag 的訊息**：跨所有頻道列出，看完可以把頻道標成已讀。
+- **狀態與勿擾**：設定會自動到期的狀態，暫停通知一段時間。
+- **匯出**：把頻道（含 thread）匯出成 Markdown 或 JSON，可以直接交給 LLM 摘要。
 - **關鍵字監看**：掃描所有頻道，只回報還沒報過的新訊息。可以交給 cron 定時跑，也可以在前景持續輪詢。預設關鍵字是「飲料」「請客」和你訂、Uber Eats 的團購連結。
 - **方便給 agent 用**：每個指令都能加 `--json`，輸出格式和 exit code 固定。[SKILL.md](SKILL.md) 可以直接裝成 Claude Code 等 agent 的 skill。
 - 輸出裡的 tag、頻道連結和網址都轉成純文字，表格會照中文字寬對齊。
@@ -147,7 +173,24 @@ slak send random "大家好"
 slak send @alice "有空嗎？"
 slak send random "收到" --thread <ts 或訊息連結>
 echo "多行內容" | slak send random -
+
+slak send random "5 分鐘後站會" --at 09:55    # 也可以用 +30m 或 'YYYY-MM-DD HH:MM'
+slak scheduled                                 # 列出排程；--cancel <id> 取消
+slak edit <訊息連結> "修正錯字"
+slak delete <訊息連結> --files
+slak react <訊息連結> eyes
+slak upload random report.pdf -m "Q3 數字"
+slak download <訊息連結> -o ~/Downloads
+slak mentions
+slak mark random
+slak status :bento: 午餐中 --for 1h            # --clear 清除
+slak dnd 30m                                   # dnd off 關閉；dnd 查看
+slak export random --since 7 --threads > random.md
 ```
+
+針對單一訊息的指令可以用訊息連結，也可以用 `<頻道> --ts <ts>` 指定。
+
+排程訊息走的是 Slack 的草稿 API（官方排程 API 不接受這種登入方式），所以排程的文字會原樣送出，`*粗體*` 和 `<@U…>` 不會被轉換。
 
 搜尋中文時請把關鍵字加上引號，例如 `'"請客"'`。不加的話，Slack 會把中文拆成單字做模糊比對，結果裡會混進很多不相干的訊息。
 

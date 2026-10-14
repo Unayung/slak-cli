@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -308,6 +309,22 @@ class Client:
             pass
         return False
 
+    def transfer(self, url, dest=None, data=None):
+        """GET url into file dest, or POST raw bytes to url. Same auth as API calls."""
+        req = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET",
+                                     headers={"Authorization": "Bearer " + self.tok["access_token"],
+                                              "Cookie": "d=" + self.tok.get("cookie", "")})
+        try:
+            with urllib.request.urlopen(req, timeout=max(self.timeout, 120)) as resp:
+                if dest is None:
+                    return resp.read()
+                with open(dest, "wb") as f:
+                    shutil.copyfileobj(resp, f)
+        except urllib.error.HTTPError as exc:
+            raise Fail(f"file transfer: HTTP {exc.code}", EX_ERR)
+        except urllib.error.URLError as exc:
+            raise Fail(f"network error: {exc.reason}", EX_NET)
+
     def paged(self, method, key, **params):
         out, cursor = [], None
         while True:
@@ -377,7 +394,7 @@ class Client:
         """'#name' | 'name' | C/G/D id | '@user' | permalink -> (channel_id, thread_ts|None)."""
         link = parse_permalink(ref)
         if link:
-            return link
+            return link[0], link[2] or link[1]
         if ref.startswith("@"):
             uid = self.find_user(ref)
             return self.call("conversations.open", users=uid)["channel"]["id"], None
@@ -396,7 +413,61 @@ def parse_permalink(ref):
         return None
     ts = f"{m.group(2)}.{m.group(3)}"
     q = urllib.parse.parse_qs(urllib.parse.urlparse(ref).query)
-    return m.group(1), (q.get("thread_ts") or [ts])[0]
+    return m.group(1), ts, (q.get("thread_ts") or [None])[0]
+
+
+def thread_of(ref):
+    """Thread ts from a permalink (its thread, or the message itself) or a bare ts."""
+    link = parse_permalink(ref)
+    return (link[2] or link[1]) if link else ref
+
+
+def msg_ref(c, ref, ts=None):
+    """(channel, ts, thread_ts) of one message: a permalink, or <channel> plus --ts."""
+    link = parse_permalink(ref)
+    if link:
+        return link
+    if not ts:
+        raise Fail("need a message link, or <channel> --ts <ts>", EX_USAGE)
+    return c.resolve(ref)[0], ts, None
+
+
+def get_message(c, cid, ts, thread_ts=None):
+    window = dict(channel=cid, oldest=ts, latest=ts, inclusive="true", limit=1)
+    if thread_ts and thread_ts != ts:
+        msgs = c.call("conversations.replies", ts=thread_ts, **window)["messages"]
+    else:
+        msgs = c.call("conversations.history", **window)["messages"]
+    for m in msgs:   # replies always lead with the thread parent
+        if m["ts"] == ts:
+            return m
+    raise Fail(f"message {ts} not found in {cid}", EX_USAGE)
+
+
+def parse_duration(s):
+    """'30m' '2h' '1d' '45s'; a bare number means minutes. Returns seconds."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", s.strip().lower())
+    if not m:
+        raise Fail(f"bad duration {s!r} - use e.g. 30m, 2h, 1d", EX_USAGE)
+    return float(m.group(1)) * {"s": 1, "": 60, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def parse_when(s, now=None):
+    """'+30m', '09:00' (next occurrence) or 'YYYY-MM-DD HH:MM' -> epoch seconds."""
+    now = now or _dt.datetime.now()
+    s = s.strip()
+    if s.startswith("+"):
+        return int(now.timestamp() + parse_duration(s[1:]))
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
+        try:
+            return int(_dt.datetime.strptime(s, fmt).timestamp())
+        except ValueError:
+            pass
+    try:
+        at = _dt.datetime.combine(now.date(), _dt.datetime.strptime(s, "%H:%M").time())
+    except ValueError:
+        raise Fail(f"bad time {s!r} - use +30m, 09:00 or 'YYYY-MM-DD HH:MM'", EX_USAGE)
+    return int((at if at > now else at + _dt.timedelta(days=1)).timestamp())
 
 
 # ------------------------------------------------------------------- output
@@ -553,23 +624,215 @@ def search(c, query, count=20, after=None):
     return (d.get("messages") or {}).get("matches", [])
 
 
-def cmd_search(args, c):
-    matches = search(c, args.query, args.limit)
+def _emit_matches(args, c, matches):
     out = [shape(c, m, "#" + (m.get("channel") or {}).get("name", "?")) for m in matches]
     emit(args, out, lambda: render(out))
 
 
-def cmd_send(args, c):
-    text = sys.stdin.read() if args.text == "-" else args.text
+def cmd_search(args, c):
+    _emit_matches(args, c, search(c, args.query, args.limit))
+
+
+def cmd_mentions(args, c):
+    me = c.call("auth.test")["user_id"]
+    _emit_matches(args, c, search(c, f"<@{me}>", args.limit))
+
+
+def read_text(arg):
+    text = sys.stdin.read() if arg == "-" else arg
     if not text.strip():
         raise Fail("empty message", EX_USAGE)
+    return text
+
+
+def cmd_send(args, c):
+    text = read_text(args.text)
     cid, thread = c.resolve(args.channel)
     if args.thread:
-        thread = (parse_permalink(args.thread) or (None, args.thread))[1]
+        thread = thread_of(args.thread)
+    if args.at:
+        # chat.scheduleMessage rejects xoxc tokens; the Slack client schedules via drafts.
+        dest = {"channel_id": cid, **({"thread_ts": thread} if thread else {})}
+        # ponytail: one plain text element, so *bold* and <@U..> stay literal
+        blocks = [{"type": "rich_text", "elements": [{"type": "rich_text_section",
+                                                      "elements": [{"type": "text", "text": text}]}]}]
+        d = c.call("drafts.create", blocks=json.dumps(blocks), destinations=json.dumps([dest]),
+                   date_scheduled=parse_when(args.at), client_msg_id=str(uuid.uuid4()),
+                   client_last_updated_ts=f"{time.time():.6f}", file_ids="[]",
+                   is_from_composer="true")["draft"]
+        data = {"channel": cid, "id": d["id"], "post_at": d["date_scheduled"],
+                "time": when(d["date_scheduled"]), "thread_ts": thread}
+        return emit(args, data, lambda: f"scheduled for {data['time']} "
+                                        f"(id {data['id']}; `slak scheduled` to list or cancel)")
     d = c.call("chat.postMessage", channel=cid, text=text, thread_ts=thread)
     link = c.call("chat.getPermalink", channel=d["channel"], message_ts=d["ts"]).get("permalink")
     data = {"channel": d["channel"], "ts": d["ts"], "thread_ts": thread, "permalink": link}
     emit(args, data, lambda: f"sent {link}")
+
+
+def _draft_text(d):
+    return "".join(e.get("text") or e.get("url") or "" for b in d.get("blocks") or []
+                   for sec in b.get("elements") or [] for e in sec.get("elements") or [])
+
+
+def cmd_scheduled(args, c):
+    if args.cancel:
+        # Drafts use optimistic locking: the client stamp must be newer than the server's.
+        c.call("drafts.delete", draft_id=args.cancel, client_last_updated_ts=f"{time.time():.6f}")
+        return emit(args, {"cancelled": args.cancel}, f"cancelled {args.cancel}")
+    drafts = c.call("drafts.list", is_active="true").get("drafts", [])
+    items = [d for d in drafts if d.get("date_scheduled") and not d.get("is_sent")]
+    cid = c.resolve(args.channel)[0] if args.channel else None
+    names = {x["id"]: c.conv_name(x) for x in c.convs()}
+    rows = []
+    for d in sorted(items, key=lambda d: d["date_scheduled"]):
+        dest = (d.get("destinations") or [{}])[0]
+        if cid and dest.get("channel_id") != cid:
+            continue
+        rows.append({"id": d["id"], "channel": names.get(dest.get("channel_id"), dest.get("channel_id")),
+                     "post_at": d["date_scheduled"], "time": when(d["date_scheduled"]),
+                     "thread_ts": dest.get("thread_ts"), "text": _draft_text(d)})
+    emit(args, rows, lambda: table([[r["time"], r["channel"], r["text"][:40].replace("\n", " "), r["id"]]
+                                    for r in rows], ["when", "channel", "text", "id"]))
+
+
+def cmd_react(args, c):
+    cid, ts, _ = msg_ref(c, args.ref, args.ts)
+    name = args.emoji.strip(":")
+    c.call("reactions.remove" if args.remove else "reactions.add", channel=cid, timestamp=ts, name=name)
+    emit(args, {"channel": cid, "ts": ts, "emoji": name, "removed": args.remove},
+         f"{'removed' if args.remove else 'added'} :{name}:")
+
+
+def cmd_edit(args, c):
+    cid, ts, _ = msg_ref(c, args.ref, args.ts)
+    c.call("chat.update", channel=cid, ts=ts, text=read_text(args.text))
+    emit(args, {"channel": cid, "ts": ts}, f"edited {ts}")
+
+
+def cmd_delete(args, c):
+    cid, ts, thread = msg_ref(c, args.ref, args.ts)
+    files = [f["id"] for f in get_message(c, cid, ts, thread).get("files") or []] if args.files else []
+    c.call("chat.delete", channel=cid, ts=ts)
+    for fid in files:   # chat.delete leaves uploaded files behind
+        c.call("files.delete", file=fid)
+    emit(args, {"channel": cid, "ts": ts, "files_deleted": files},
+         f"deleted {ts}" + (f" and {len(files)} file(s)" if files else ""))
+
+
+def cmd_mark(args, c):
+    cid, _ = c.resolve(args.channel)
+    ts = args.ts
+    if not ts:
+        latest = c.call("conversations.history", channel=cid, limit=1)["messages"]
+        ts = latest[0]["ts"] if latest else None
+    if ts:
+        c.call("conversations.mark", channel=cid, ts=ts)
+    emit(args, {"channel": cid, "ts": ts}, f"marked read up to {when(ts)}" if ts else "nothing to mark")
+
+
+def cmd_download(args, c):
+    cid, ts, thread = msg_ref(c, args.ref, args.ts)
+    files = get_message(c, cid, ts, thread).get("files") or []
+    if not files:
+        raise Fail("that message has no files", EX_USAGE)
+    os.makedirs(args.out, exist_ok=True)
+    saved = []
+    for f in files:
+        url = f.get("url_private_download") or f.get("url_private")
+        if not url:   # deleted, or an external link
+            continue
+        name = os.path.basename(f.get("name") or f["id"])
+        path = os.path.join(args.out, name)
+        if os.path.exists(path):   # never clobber a local file
+            path = os.path.join(args.out, f"{f['id']}-{name}")
+        c.transfer(url, dest=path)
+        saved.append({"id": f["id"], "name": name, "path": path, "size": os.path.getsize(path)})
+    emit(args, saved, lambda: "\n".join(f"saved {s['path']} ({s['size']} bytes)" for s in saved)
+         or "(no downloadable files)")
+
+
+def cmd_upload(args, c):
+    cid, thread = c.resolve(args.channel)
+    if args.thread:
+        thread = thread_of(args.thread)
+    ids = []
+    for p in args.files:
+        name = os.path.basename(p)
+        try:
+            with open(p, "rb") as f:
+                blob = f.read()
+        except OSError as exc:
+            raise Fail(f"cannot read {p}: {exc.strerror}", EX_USAGE)
+        u = c.call("files.getUploadURLExternal", filename=name, length=len(blob))
+        c.transfer(u["upload_url"], data=blob)
+        ids.append({"id": u["file_id"], "title": name})
+    d = c.call("files.completeUploadExternal", files=json.dumps(ids), channel_id=cid,
+               thread_ts=thread, initial_comment=args.comment)
+    out = [{"id": f["id"], "name": f.get("name") or f.get("title"),
+            "permalink": f.get("permalink")} for f in d.get("files", [])]
+    emit(args, out, lambda: "\n".join(f"uploaded {f['name']} {f['permalink']}" for f in out))
+
+
+def cmd_status(args, c):
+    words = list(args.words)
+    if args.clear or words:
+        emoji = words.pop(0) if words and re.fullmatch(r":[^:\s]+:", words[0]) else ""
+        until = int(time.time() + parse_duration(args.for_)) if args.for_ and not args.clear else 0
+        c.call("users.profile.set", profile=json.dumps(
+            {"status_emoji": emoji, "status_text": " ".join(words), "status_expiration": until}))
+    p = c.call("users.profile.get")["profile"]
+    data = {"emoji": p.get("status_emoji", ""), "text": p.get("status_text", "")}
+    # Slack keeps a stale expiration around after a status clears; only show a live one.
+    data["expires"] = (p.get("status_expiration") or None) if data["emoji"] or data["text"] else None
+    emit(args, data, lambda: (f"{data['emoji']} {data['text']}".strip() or "(no status)")
+         + (f"  until {when(data['expires'])}" if data["expires"] else ""))
+
+
+def cmd_dnd(args, c):
+    if args.duration == "off":
+        try:
+            c.call("dnd.endSnooze")
+        except Fail as exc:
+            if "snooze_not_active" not in exc.msg:
+                raise
+    elif args.duration:
+        c.call("dnd.setSnooze", num_minutes=max(1, round(parse_duration(args.duration) / 60)))
+    d = c.call("dnd.info")
+    data = {"snoozing": bool(d.get("snooze_enabled")),
+            "until": d.get("snooze_endtime") if d.get("snooze_enabled") else None,
+            "schedule": f"{when(d['next_dnd_start_ts'])} - {when(d['next_dnd_end_ts'])}"
+            if d.get("dnd_enabled") and d.get("next_dnd_start_ts") and not d.get("snooze_enabled")
+            else None}
+    emit(args, data, lambda: (f"snoozed until {when(data['until'])}" if data["snoozing"]
+                              else "notifications on")
+         + (f"; scheduled DND {data['schedule']}" if data["schedule"] else ""))
+
+
+def cmd_export(args, c):
+    cid, _ = c.resolve(args.channel)
+    oldest = time.time() - args.since * 86400
+    msgs = c.paged("conversations.history", "messages", channel=cid, oldest=f"{oldest:.6f}", limit=200)
+    out = []
+    for m in reversed(msgs):
+        out.append(shape(c, m))
+        if args.threads and m.get("reply_count"):
+            replies = c.paged("conversations.replies", "messages", channel=cid, ts=m["ts"], limit=200)
+            out += [shape(c, r) for r in replies if r["ts"] != m["ts"]]
+    if args.json:
+        return emit(args, out)
+    name = args.channel if args.channel.startswith(("#", "@")) else "#" + args.channel
+    lines, day = [f"# {name}"], None
+    for m in out:
+        d = _dt.datetime.fromtimestamp(float(m["ts"]))
+        if d.date() != day and not m.get("thread_ts"):   # replies stay under their parent
+            day = d.date()
+            lines.append(f"\n## {day.isoformat()}\n")
+        indent = "  " if m.get("thread_ts") else ""
+        body = m["text"].replace("\n", "\n" + indent + "  ")
+        files = f" [files: {', '.join(map(str, m['files']))}]" if m.get("files") else ""
+        lines.append(f"{indent}- **{d:%H:%M} {m['user']}**: {body}{files}")
+    print("\n".join(lines))
 
 
 def cmd_users(args, c):
@@ -645,12 +908,12 @@ def build_parser():
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                         help="stable JSON envelope on stdout")
     common.add_argument("--workspace", "-w", default=argparse.SUPPRESS,
-                        help="team id or name (needed when slk has several)")
+                        help="team id, name or domain (needed with several workspaces)")
     common.add_argument("--debug", action="store_true", default=argparse.SUPPRESS)
     common.add_argument("--timeout", type=int, default=argparse.SUPPRESS)
 
     p = argparse.ArgumentParser(prog="slak", parents=[common],
-                                description="Slack from the shell, as yourself (auth via slk).")
+                                description="Slack from the shell, as yourself.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add(name, fn, help):
@@ -677,6 +940,48 @@ def build_parser():
     sp.add_argument("channel")
     sp.add_argument("text", help="message text, or - to read stdin")
     sp.add_argument("--thread", "-t", help="reply in thread: ts or permalink")
+    sp.add_argument("--at", help="schedule instead: +30m, 09:00, or 'YYYY-MM-DD HH:MM'")
+    sp = add("scheduled", cmd_scheduled, "list scheduled messages, or --cancel one")
+    sp.add_argument("channel", nargs="?")
+    sp.add_argument("--cancel", metavar="ID")
+    sp = add("mentions", cmd_mentions, "recent messages that @-mention you")
+    sp.add_argument("--limit", "-n", type=int, default=20)
+
+    def msg_target(sp):
+        sp.add_argument("ref", help="message link, or a channel together with --ts")
+        sp.add_argument("--ts", help="message ts when ref is a channel")
+
+    sp = add("react", cmd_react, "add (or --remove) an emoji reaction")
+    msg_target(sp)
+    sp.add_argument("emoji", help="name, with or without colons: plus1, :eyes:")
+    sp.add_argument("--remove", action="store_true")
+    sp = add("edit", cmd_edit, "replace the text of one of your messages")
+    msg_target(sp)
+    sp.add_argument("text", help="new text, or - to read stdin")
+    sp = add("delete", cmd_delete, "delete one of your messages")
+    msg_target(sp)
+    sp.add_argument("--files", action="store_true", help="also delete files attached to it")
+    sp = add("mark", cmd_mark, "mark a conversation read (up to its latest message, or --ts)")
+    sp.add_argument("channel")
+    sp.add_argument("--ts")
+    sp = add("download", cmd_download, "save the files attached to a message")
+    msg_target(sp)
+    sp.add_argument("--out", "-o", default=".", help="directory (default: current)")
+    sp = add("upload", cmd_upload, "upload files to a channel, DM or thread")
+    sp.add_argument("channel")
+    sp.add_argument("files", nargs="+")
+    sp.add_argument("--comment", "-m", help="message posted with the files")
+    sp.add_argument("--thread", "-t", help="into a thread: ts or permalink")
+    sp = add("status", cmd_status, "show, set (:emoji: text --for 1h) or --clear your status")
+    sp.add_argument("words", nargs="*", metavar="[:emoji:] text")
+    sp.add_argument("--for", dest="for_", metavar="DURATION", help="auto-clear after e.g. 30m, 2h")
+    sp.add_argument("--clear", action="store_true")
+    sp = add("dnd", cmd_dnd, "show do-not-disturb, snooze for a duration (30m, 2h), or 'off'")
+    sp.add_argument("duration", nargs="?")
+    sp = add("export", cmd_export, "dump channel history as Markdown (or --json)")
+    sp.add_argument("channel")
+    sp.add_argument("--since", type=float, default=7, help="days back (default 7)")
+    sp.add_argument("--threads", action="store_true", help="include thread replies")
     sp = add("users", cmd_users, "find people (cached; --refresh to reload)")
     sp.add_argument("query", nargs="?")
     sp.add_argument("--refresh", action="store_true")
