@@ -196,7 +196,10 @@ def desktop_cookie():
         pws = keyring_passwords("/Library/Containers/" in root)
         rounds = 1003 if sys.platform == "darwin" else 1
         if not pws:
-            raise Fail("no 'Slack Safe Storage' key in the keyring (locked?)", EX_AUTH)
+            hint = (" - on macOS run it in a local Terminal; Keychain can't prompt over SSH"
+                    if sys.platform == "darwin" else "")
+            raise Fail(f"no 'Slack Safe Storage' key readable from the keyring (locked?){hint}",
+                       EX_AUTH)
     val = decrypt_cookie(enc[3:], pws, rounds)
     if not val:
         raise Fail("could not decrypt the Slack cookie with the keyring key", EX_AUTH)

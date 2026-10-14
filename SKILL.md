@@ -30,7 +30,9 @@ slak login acme            # just one, by subdomain
 Keyring / libsecret on Linux, Keychain on macOS - macOS may show a one-time
 "allow" prompt), mints an xoxc token from it, and saves both to
 `~/.config/slak/tokens/<TEAM>.json` (0600). Expired tokens are re-minted from
-the cookie automatically. Needs `openssl` on PATH; `secret-tool` on Linux.
+the cookie automatically. On macOS `slak login` must run in a local Terminal:
+Keychain can't prompt over SSH, so there it exits `3` and so does re-minting.
+Needs `openssl` on PATH; `secret-tool` on Linux.
 Windows and KWallet are not supported - tokens saved by
 [slk](https://github.com/gammons/slk) in `~/.local/share/slk/tokens/` are read
 as a fallback there.

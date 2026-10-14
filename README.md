@@ -90,6 +90,10 @@ prompt. `slak login` decrypts the cookie with `openssl` and loads the workspace
 page with it to get an `xoxc` token. Both are saved to
 `~/.config/slak/tokens/<TEAM>.json` with mode 0600.
 
+On macOS, run `slak login` in a local Terminal. Keychain cannot show its
+"allow" prompt over SSH. Saved tokens keep working over SSH, but re-minting
+an expired token there fails until you log in locally again.
+
 Not supported: Windows and KWallet. On those, tokens that
 [slk](https://github.com/gammons/slk) saved in `~/.local/share/slk/tokens/`
 are picked up instead. `SLACK_TOKEN` + `SLACK_COOKIE` env vars override
@@ -171,6 +175,8 @@ Exit code：`0` 成功 · `1` 錯誤 · `2` 用法錯誤 · `3` 登入失效 · 
 ### 登入原理
 
 桌面版把登入狀態存在名為 `d` 的 cookie 裡，這個 cookie 經過 AES 加密，放在 Chromium 的 cookie 資料庫。金鑰存在作業系統的 keyring：Linux 是 GNOME Keyring 或 libsecret，macOS 是鑰匙圈，第一次讀取時可能會跳出「允許」的確認視窗。`slak login` 用 `openssl` 解開 cookie，再帶著它打開 workspace 頁面拿到 `xoxc` token。兩者都存在 `~/.config/slak/tokens/<TEAM>.json`，權限 0600。
+
+macOS 上請在本機的終端機執行 `slak login`，透過 SSH 執行時鑰匙圈無法跳出「允許」視窗。登入後，透過 SSH 照常可以使用存好的 token，但 token 過期時無法在 SSH 下自動更新，要回到本機重新登入一次。
 
 Windows 和 KWallet 目前不支援。在這兩種環境下，如果裝過 [slk](https://github.com/gammons/slk)，slak 會改讀它存在 `~/.local/share/slk/tokens/` 的 token。設定 `SLACK_TOKEN` 和 `SLACK_COOKIE` 環境變數的話，會優先使用環境變數。
 
