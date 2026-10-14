@@ -1,0 +1,715 @@
+#!/usr/bin/env python3
+"""
+slak - agent-native Slack CLI that acts as YOU.
+
+Zero dependencies (Python 3.8+ stdlib only). Every command supports --json for
+machine consumption. Designed to be driven by a human OR by an agent runtime.
+
+Auth rides on the Slack desktop app: `slak login` decrypts its `d` session
+cookie and mints an xoxc token from it, the same recipe as slk
+(https://github.com/gammons/slk). No Slack App, no OAuth, no admin approval.
+When the token goes stale it is re-minted from the cookie automatically.
+The only non-Python piece is the `openssl` binary, for AES.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import glob
+import hashlib
+import html
+import json
+import os
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API = "https://slack.com/api/"
+STATE_DIR = os.path.expanduser(os.environ.get("SLAK_HOME", "~/.config/slak"))
+TOKEN_DIR = os.path.join(STATE_DIR, "tokens")
+# Tokens saved by slk are picked up too, so slk users need no `slak login`.
+SLK_TOKEN_DIR = os.path.expanduser(os.environ.get("SLK_TOKEN_DIR", "~/.local/share/slk/tokens"))
+
+# Exit codes - stable contract for scripts and agent runtimes.
+EX_OK, EX_ERR, EX_USAGE, EX_AUTH, EX_NET = 0, 1, 2, 3, 4
+
+AUTH_ERRORS = {"invalid_auth", "not_authed", "token_revoked", "token_expired",
+               "account_inactive"}
+
+DEFAULT_WATCH = ["飲料", "請客", "nidin.shop", "ubereats.com", "eats.uber.com"]
+
+
+class Fail(Exception):
+    def __init__(self, msg, code=EX_ERR, detail=None):
+        super().__init__(msg)
+        self.msg, self.code, self.detail = msg, code, detail
+
+
+# -------------------------------------------------------------------- state
+
+def _read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def _write_json(path, data):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
+                   "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def load_token(workspace=None):
+    """SLACK_TOKEN + SLACK_COOKIE env win; then slak's tokens; then slk's."""
+    if os.environ.get("SLACK_TOKEN"):
+        return {"access_token": os.environ["SLACK_TOKEN"],
+                "cookie": os.environ.get("SLACK_COOKIE", ""), "team_id": "env"}
+    toks = {}
+    for d in (SLK_TOKEN_DIR, TOKEN_DIR):   # later dir wins per team
+        for p in sorted(glob.glob(os.path.join(d, "*.json"))):
+            t = _read_json(p, {})
+            if t.get("access_token"):
+                toks[t.get("team_id")] = t
+    toks = list(toks.values())
+    if not toks:
+        raise Fail("not logged in - sign in to the Slack desktop app, then `slak login`", EX_AUTH)
+    if not workspace:
+        if len(toks) > 1:
+            names = ", ".join(f"{t.get('team_id')} ({t.get('team_name')})" for t in toks)
+            raise Fail(f"several workspaces, pick one with --workspace: {names}", EX_USAGE)
+        return toks[0]
+    w = workspace.lower()
+    for t in toks:
+        if w in (str(t.get("team_id", "")).lower(), str(t.get("team_name", "")).lower(),
+                 str(t.get("domain", "")).lower()):
+            return t
+    for t in toks:
+        if str(t.get("team_name", "")).lower().startswith(w):
+            return t
+    raise Fail(f"workspace {workspace!r} not found - `slak login` lists what you have", EX_USAGE)
+
+
+# ------------------------------------------------------------ desktop login
+# The desktop app's `d` cookie (Chromium cookie store, AES-encrypted with a key
+# kept in the OS keyring) is the real session; xoxc tokens are minted from it.
+
+def desktop_dir():
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        lib = os.path.join(home, "Library")
+        cands = [os.path.join(lib, "Application Support", "Slack"),
+                 os.path.join(lib, "Containers", "com.tinyspeck.slackmacgap", "Data",
+                              "Library", "Application Support", "Slack")]
+    else:
+        cands = [os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "Slack"),
+                 os.path.join(home, ".var", "app", "com.slack.Slack", "config", "Slack"),
+                 os.path.join(home, "snap", "slack", "current", ".config", "Slack")]
+    for c in cands:
+        if os.path.isdir(c):
+            return c
+    raise Fail("Slack desktop app data not found - install it and sign in", EX_AUTH)
+
+
+def _run(cmd, data=None):
+    try:
+        return subprocess.run(cmd, input=data, capture_output=True, timeout=60).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return b""
+
+
+def keyring_passwords(sandboxed):
+    if sys.platform == "darwin":
+        accts = ["Slack Key", "Slack App Store Key"]
+        if sandboxed:
+            accts.reverse()
+        return [p for p in (_run(["/usr/bin/security", "find-generic-password", "-w",
+                                  "-s", "Slack Safe Storage", "-a", a]).rstrip(b"\n")
+                            for a in accts) if p]
+    # ponytail: libsecret only (GNOME Keyring, KeePassXC); KWallet users can log in via slk
+    queries = [["xdg:schema", "chrome_libsecret_os_crypt_password_v2", "application", "Slack"],
+               ["xdg:schema", "chrome_libsecret_os_crypt_password_v1", "application", "Slack"],
+               ["xdg:schema", "org.qt.keychain", "server", "Slack Keys", "user", "Slack Safe Storage"]]
+    return [p for p in (_run(["secret-tool", "lookup", *q]) for q in queries) if p]
+
+
+DOMAIN_HASHES = {hashlib.sha256(h).digest() for h in (b"slack.com", b".slack.com")}
+
+
+def decrypt_cookie(enc, passwords, rounds):
+    """Chromium v10/v11 cookie: AES-128-CBC, PBKDF2(pw, 'saltysalt'), IV of spaces."""
+    for pw in passwords:
+        key = hashlib.pbkdf2_hmac("sha1", pw, b"saltysalt", rounds, 16)
+        out = _run(["openssl", "enc", "-d", "-aes-128-cbc", "-nopad",
+                    "-K", key.hex(), "-iv", "20" * 16], enc)
+        if not out or not 1 <= out[-1] <= 16:
+            continue
+        out = out[:-out[-1]]
+        if out[:32] in DOMAIN_HASHES:   # newer Chromium binds the value to its host
+            out = out[32:]
+        if out and all(32 <= b < 127 for b in out):
+            return out.decode()
+    return None
+
+
+def desktop_cookie():
+    root = desktop_dir()
+    src = os.path.join(root, "Cookies")
+    if not os.path.exists(src):
+        src = os.path.join(root, "Network", "Cookies")
+    with tempfile.TemporaryDirectory() as tmp:
+        # The running app holds the DB open in WAL mode; read a copy.
+        dst = os.path.join(tmp, "Cookies")
+        try:
+            shutil.copy(src, dst)
+        except OSError:
+            raise Fail("Slack cookie store not found - sign in to the desktop app", EX_AUTH)
+        if os.path.exists(src + "-wal"):
+            shutil.copy(src + "-wal", dst + "-wal")
+        db = sqlite3.connect(dst)
+        row = db.execute("SELECT value, encrypted_value FROM cookies "
+                         "WHERE host_key='.slack.com' AND name='d'").fetchone()
+        db.close()
+    if not row:
+        raise Fail("no Slack session cookie - sign in to the desktop app", EX_AUTH)
+    plain, enc = row
+    if plain:
+        return plain
+    if not shutil.which("openssl"):
+        raise Fail("`openssl` not found - it is needed to decrypt the Slack cookie", EX_AUTH)
+    if enc[:3] == b"v10" and sys.platform != "darwin":
+        pws, rounds = [b"peanuts"], 1   # Chromium's hardcoded no-keyring key
+    else:
+        pws = keyring_passwords("/Library/Containers/" in root)
+        rounds = 1003 if sys.platform == "darwin" else 1
+        if not pws:
+            raise Fail("no 'Slack Safe Storage' key in the keyring (locked?)", EX_AUTH)
+    val = decrypt_cookie(enc[3:], pws, rounds)
+    if not val:
+        raise Fail("could not decrypt the Slack cookie with the keyring key", EX_AUTH)
+    return val
+
+
+def desktop_domains():
+    st = _read_json(os.path.join(desktop_dir(), "storage", "root-state.json"), {})
+    return [w["domain"] for w in (st.get("workspaces") or {}).values() if w.get("domain")]
+
+
+def mint(domain, cookie):
+    """xoxc token embedded in the workspace page. Slack answers 403 yet still embeds it."""
+    req = urllib.request.Request(f"https://{domain}.slack.com/", headers={"Cookie": "d=" + cookie})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+    except urllib.error.URLError as exc:
+        raise Fail(f"network error: {exc.reason}", EX_NET)
+    m = re.search(rb'"api_token":"(xoxc-[^"]+)"', body)
+    return m.group(1).decode() if m else None
+
+
+def login(domains=None):
+    """Mint and save a token for each desktop workspace (or the given domains)."""
+    cookie = desktop_cookie()
+    saved = {}
+    for dom in domains or desktop_domains():
+        xoxc = mint(dom, cookie)
+        if not xoxc:
+            continue
+        tok = {"access_token": xoxc, "cookie": cookie}
+        me = Client(tok).call("auth.test", _retried=True)
+        if me["team_id"] in saved:   # renamed workspaces redirect to the same team
+            continue
+        tok.update(team_id=me["team_id"], team_name=me["team"],
+                   domain=urllib.parse.urlparse(me["url"]).hostname.split(".")[0])
+        _write_json(os.path.join(TOKEN_DIR, f"{me['team_id']}.json"), tok)
+        saved[me["team_id"]] = tok
+    if not saved:
+        raise Fail("signed-in cookie found but no workspace page yielded a token", EX_AUTH)
+    return list(saved.values())
+
+
+# ------------------------------------------------------------------- client
+
+class Client:
+    def __init__(self, token, debug=False, timeout=20):
+        self.tok = token
+        self.debug = debug
+        self.timeout = timeout
+        self.team = token.get("team_id", "env")
+        self._users_path = os.path.join(STATE_DIR, f"users-{self.team}.json")
+        self._users = None   # id -> {name, real_name}
+        self._convs = None   # list from users.conversations
+
+    def call(self, method, _retried=False, **params):
+        body = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None}).encode()
+        req = urllib.request.Request(API + method, data=body, method="POST", headers={
+            "Authorization": "Bearer " + self.tok["access_token"],
+            "Cookie": "d=" + self.tok.get("cookie", ""),
+            "Content-Type": "application/x-www-form-urlencoded",
+        })
+        if self.debug:
+            print(f"[debug] {method} {params}", file=sys.stderr)
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8", "replace"))
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429 and attempt < 2:
+                    wait = int(exc.headers.get("Retry-After") or 5)
+                    print(f"rate limited on {method}, waiting {wait}s", file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+                raise Fail(f"{method}: HTTP {exc.code}", EX_NET if exc.code >= 500 else EX_ERR)
+            except urllib.error.URLError as exc:
+                raise Fail(f"network error: {exc.reason}", EX_NET)
+            except TimeoutError:
+                raise Fail("request timed out", EX_NET)
+            except ValueError:
+                raise Fail(f"{method}: non-JSON response", EX_ERR)
+        if not data.get("ok"):
+            err = data.get("error", "unknown_error")
+            if err in AUTH_ERRORS:
+                if not _retried and self.refresh():
+                    return self.call(method, _retried=True, **params)
+                raise Fail(f"slack session rejected ({err}) - sign in to the Slack desktop "
+                           "app again, then `slak login`", EX_AUTH)
+            raise Fail(f"{method}: {err}", EX_ERR, detail=data)
+        return data
+
+    def refresh(self):
+        """Re-mint this team's xoxc from the desktop cookie. Quietly False on any failure."""
+        if self.team == "env":
+            return False
+        try:
+            for tok in login():
+                if tok["team_id"] == self.team:
+                    self.tok = tok
+                    return True
+        except Fail:
+            pass
+        return False
+
+    def paged(self, method, key, **params):
+        out, cursor = [], None
+        while True:
+            data = self.call(method, cursor=cursor, **params)
+            out += data.get(key, [])
+            cursor = (data.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                return out
+
+    # users ---------------------------------------------------------------
+
+    def users(self, refresh=False):
+        if self._users is None:
+            self._users = {} if refresh else _read_json(self._users_path, {})
+        if refresh or not self._users:
+            for u in self.paged("users.list", "members", limit=1000):
+                p = u.get("profile") or {}
+                self._users[u["id"]] = {
+                    "name": p.get("display_name") or u.get("name") or u["id"],
+                    "real_name": p.get("real_name") or u.get("real_name") or "",
+                    "handle": u.get("name", ""), "deleted": u.get("deleted", False),
+                    "bot": u.get("is_bot", False)}
+            _write_json(self._users_path, self._users)
+        return self._users
+
+    def user_name(self, uid):
+        if not uid:
+            return ""
+        users = self.users()
+        if uid not in users:
+            try:
+                u = self.call("users.info", user=uid)["user"]
+                p = u.get("profile") or {}
+                users[uid] = {"name": p.get("display_name") or u.get("name") or uid,
+                              "real_name": p.get("real_name") or "", "handle": u.get("name", ""),
+                              "deleted": u.get("deleted", False), "bot": u.get("is_bot", False)}
+                _write_json(self._users_path, users)
+            except Fail:
+                return uid
+        return users[uid]["name"]
+
+    def find_user(self, name):
+        name = name.lstrip("@").lower()
+        if re.fullmatch(r"[uw][a-z0-9]{6,}", name):
+            return name.upper()
+        for refresh in (False, True):
+            for uid, u in self.users(refresh=refresh).items():
+                if name in (u["name"].lower(), u["handle"].lower(), u["real_name"].lower()):
+                    return uid
+        raise Fail(f"user {name!r} not found - try `slak users {name}`", EX_USAGE)
+
+    # conversations -------------------------------------------------------
+
+    def convs(self):
+        if self._convs is None:
+            self._convs = self.paged("users.conversations", "channels", limit=1000,
+                                     exclude_archived="true",
+                                     types="public_channel,private_channel,mpim,im")
+        return self._convs
+
+    def conv_name(self, c):
+        if c.get("is_im"):
+            return "@" + self.user_name(c.get("user"))
+        return "#" + (c.get("name") or c["id"])
+
+    def resolve(self, ref):
+        """'#name' | 'name' | C/G/D id | '@user' | permalink -> (channel_id, thread_ts|None)."""
+        link = parse_permalink(ref)
+        if link:
+            return link
+        if ref.startswith("@"):
+            uid = self.find_user(ref)
+            return self.call("conversations.open", users=uid)["channel"]["id"], None
+        if re.fullmatch(r"[CGD][A-Z0-9]{6,}", ref):
+            return ref, None
+        name = ref.lstrip("#").lower()
+        for c in self.convs():
+            if (c.get("name") or "").lower() == name:
+                return c["id"], None
+        raise Fail(f"channel {ref!r} not found among channels you are in", EX_USAGE)
+
+
+def parse_permalink(ref):
+    m = re.search(r"/archives/([A-Z0-9]+)/p(\d{10})(\d{6})", ref)
+    if not m:
+        return None
+    ts = f"{m.group(2)}.{m.group(3)}"
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(ref).query)
+    return m.group(1), (q.get("thread_ts") or [ts])[0]
+
+
+# ------------------------------------------------------------------- output
+
+def emit(args, data, human=None):
+    if args.json:
+        print(json.dumps({"ok": True, "data": data}, ensure_ascii=False, indent=2))
+    elif human is not None:
+        print(human() if callable(human) else human)
+    else:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _w(text):
+    """Display width, counting CJK glyphs as two columns."""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(text))
+
+
+def table(rows, headers):
+    if not rows:
+        return "(no rows)"
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(_w(c) for c in col) for col in cols]
+    pad = lambda t, w: str(t) + " " * max(0, w - _w(t))
+    out = ["  ".join(pad(h, w) for h, w in zip(headers, widths)).rstrip(),
+           "  ".join("-" * w for w in widths)]
+    out += ["  ".join(pad(c, w) for c, w in zip(r, widths)).rstrip() for r in rows]
+    return "\n".join(out)
+
+
+def when(ts):
+    return _dt.datetime.fromtimestamp(float(ts)).strftime("%m-%d %H:%M")
+
+
+def plain(client, text):
+    """Slack mrkdwn -> readable text: <@U1> -> @name, <url|label> -> url, entities."""
+    def sub(m):
+        inner = m.group(1)
+        target, _, label = inner.partition("|")
+        if target.startswith("@"):
+            return "@" + client.user_name(target[1:])
+        if target.startswith("#"):
+            return "#" + (label or target[1:])
+        if target.startswith("!"):
+            return "@" + (label or target[1:].split("^")[0])
+        return target
+    return html.unescape(re.sub(r"<([^<>]+)>", sub, text or ""))
+
+
+def shape(client, m, channel=None):
+    out = {"ts": m["ts"], "time": when(m["ts"]),
+           "user": client.user_name(m.get("user")) or m.get("username") or m.get("bot_id", ""),
+           "text": plain(client, m.get("text", ""))}
+    if channel:
+        out["channel"] = channel
+    if m.get("thread_ts") and m.get("thread_ts") != m["ts"]:
+        out["thread_ts"] = m["thread_ts"]
+    if m.get("reply_count"):
+        out["replies"] = m["reply_count"]
+    if m.get("files"):
+        out["files"] = [f.get("name") or f.get("title") for f in m["files"]]
+    if m.get("permalink"):
+        out["permalink"] = m["permalink"]
+    return out
+
+
+def render(msgs):
+    lines = []
+    for m in msgs:
+        head = f"[{m['time']}] " + (f"{m['channel']} " if m.get("channel") else "") + f"{m['user']}:"
+        body = m["text"].replace("\n", "\n    ")
+        tail = f"  ({m['replies']} replies, ts {m['ts']})" if m.get("replies") else ""
+        files = f"\n    [files] {', '.join(map(str, m['files']))}" if m.get("files") else ""
+        lines.append(f"{head} {body}{tail}{files}")
+    return "\n".join(lines) or "(no messages)"
+
+
+# ----------------------------------------------------------------- commands
+
+def cmd_login(args, _):
+    toks = login(args.domain or None)
+    rows = [{k: t[k] for k in ("team_id", "team_name", "domain")} for t in toks]
+    emit(args, rows, lambda: "logged in:\n" + table(
+        [[r["team_name"], r["domain"], r["team_id"]] for r in rows], ["workspace", "domain", "id"]))
+
+
+def cmd_whoami(args, c):
+    d = c.call("auth.test")
+    data = {"user": d.get("user"), "user_id": d.get("user_id"), "team": d.get("team"),
+            "team_id": d.get("team_id"), "url": d.get("url")}
+    emit(args, data, lambda: f"{data['user']} ({data['user_id']}) @ {data['team']} {data['url']}")
+
+
+def cmd_channels(args, c):
+    rows = [{"id": x["id"], "name": c.conv_name(x),
+             "type": "im" if x.get("is_im") else "mpim" if x.get("is_mpim")
+             else "private" if x.get("is_private") else "public"} for x in c.convs()]
+    if args.filter:
+        rows = [r for r in rows if args.filter.lower() in r["name"].lower()]
+    rows.sort(key=lambda r: (r["type"], r["name"]))
+    emit(args, rows, lambda: table([[r["name"], r["type"], r["id"]] for r in rows],
+                                   ["name", "type", "id"]))
+
+
+def cmd_unread(args, c):
+    counts = c.call("client.counts")
+    by_id = {x["id"]: x for x in c.convs()}
+    rows = []
+    for kind in ("channels", "mpims", "ims"):
+        for x in counts.get(kind, []):
+            if x.get("has_unreads") or x.get("mention_count"):
+                conv = by_id.get(x["id"], {"id": x["id"]})
+                rows.append({"id": x["id"], "name": c.conv_name(conv),
+                             "mentions": x.get("mention_count", 0), "latest": when(x["latest"])})
+    threads = (counts.get("threads") or {})
+    rows.sort(key=lambda r: (-r["mentions"], r["name"]))
+    data = {"conversations": rows, "threads_unread": threads.get("has_unreads", False),
+            "threads_mentions": threads.get("mention_count", 0)}
+    def human():
+        out = table([[r["name"], r["mentions"] or "", r["latest"]] for r in rows],
+                    ["conversation", "mentions", "latest"])
+        if data["threads_unread"]:
+            out += f"\n\nthreads: unread ({data['threads_mentions']} mentions)"
+        return out
+    emit(args, data, human)
+
+
+def cmd_read(args, c):
+    cid, thread = c.resolve(args.channel)
+    if thread:
+        return _thread(args, c, cid, thread)
+    msgs = c.call("conversations.history", channel=cid, limit=args.limit)["messages"]
+    out = [shape(c, m) for m in reversed(msgs)]
+    emit(args, out, lambda: render(out))
+
+
+def cmd_thread(args, c):
+    cid, ts = c.resolve(args.ref)
+    ts = args.ts or ts
+    if not ts:
+        raise Fail("need a permalink, or `slak thread <channel> <ts>`", EX_USAGE)
+    _thread(args, c, cid, ts)
+
+
+def _thread(args, c, cid, ts):
+    msgs = c.paged("conversations.replies", "messages", channel=cid, ts=ts, limit=200)
+    out = [shape(c, m) for m in msgs]
+    emit(args, out, lambda: render(out))
+
+
+def search(c, query, count=20, after=None):
+    q = query + (f" after:{after}" if after else "")
+    d = c.call("search.messages", query=q, count=count, sort="timestamp", sort_dir="desc")
+    return (d.get("messages") or {}).get("matches", [])
+
+
+def cmd_search(args, c):
+    matches = search(c, args.query, args.limit)
+    out = [shape(c, m, "#" + (m.get("channel") or {}).get("name", "?")) for m in matches]
+    emit(args, out, lambda: render(out))
+
+
+def cmd_send(args, c):
+    text = sys.stdin.read() if args.text == "-" else args.text
+    if not text.strip():
+        raise Fail("empty message", EX_USAGE)
+    cid, thread = c.resolve(args.channel)
+    if args.thread:
+        thread = (parse_permalink(args.thread) or (None, args.thread))[1]
+    d = c.call("chat.postMessage", channel=cid, text=text, thread_ts=thread)
+    link = c.call("chat.getPermalink", channel=d["channel"], message_ts=d["ts"]).get("permalink")
+    data = {"channel": d["channel"], "ts": d["ts"], "thread_ts": thread, "permalink": link}
+    emit(args, data, lambda: f"sent {link}")
+
+
+def cmd_users(args, c):
+    q = (args.query or "").lower()
+    rows = [{"id": uid, **u} for uid, u in c.users(refresh=args.refresh).items()
+            if not u["deleted"] and (not q or q in (u["name"] + u["handle"] + u["real_name"]).lower())]
+    rows.sort(key=lambda r: r["name"].lower())
+    emit(args, rows, lambda: table([[r["name"], r["real_name"], r["handle"], r["id"]] for r in rows],
+                                   ["display", "real name", "handle", "id"]))
+
+
+# ---------------------------------------------------------------------- watch
+
+def worth_alerting(hit, me):
+    """Final say on whether a keyword hit is worth surfacing.
+
+    hit: {"keyword", "channel", "user", "user_id", "text", "ts", "permalink"}
+    me:  your own user id (from auth.test)
+    """
+    # ponytail: only drops your own messages; tune per channel/keyword as noise shows up
+    return hit["user_id"] != me
+
+
+def scan(c, keywords, since_days, seen, me):
+    """One pass: search each keyword, keep literal matches newer than the window."""
+    cutoff = time.time() - since_days * 86400
+    after = (_dt.date.today() - _dt.timedelta(days=since_days + 1)).isoformat()
+    hits = []
+    for kw in keywords:
+        # Quoted, or Slack segments CJK and fuzzily matches single characters.
+        for m in search(c, f'"{kw}"', count=50, after=after):
+            key = f"{(m.get('channel') or {}).get('id')}:{m['ts']}"
+            if key in seen or float(m["ts"]) < cutoff:
+                continue
+            if kw.lower() not in (m.get("text") or "").lower():
+                continue
+            hit = shape(c, m, "#" + (m.get("channel") or {}).get("name", "?"))
+            hit.update(keyword=kw, user_id=m.get("user"))
+            seen[key] = float(m["ts"])
+            if worth_alerting(hit, me):
+                hits.append(hit)
+    hits.sort(key=lambda h: float(h["ts"]))
+    return hits
+
+
+def cmd_watch(args, c):
+    keywords = args.keyword or DEFAULT_WATCH
+    seen_path = os.path.join(STATE_DIR, f"seen-{c.team}.json")
+    me = c.call("auth.test")["user_id"]
+    while True:
+        seen = _read_json(seen_path, {})
+        hits = scan(c, keywords, args.since, seen, me)
+        horizon = time.time() - (args.since + 7) * 86400
+        _write_json(seen_path, {k: v for k, v in seen.items() if v >= horizon})
+        if args.once:
+            emit(args, hits, lambda: "\n".join(
+                f"[{h['keyword']}] " + render([h]) + f"\n    {h.get('permalink', '')}"
+                for h in hits) or "(no new hits)")
+            return EX_OK
+        for h in hits:
+            print(json.dumps(h, ensure_ascii=False) if args.json else
+                  f"[{h['keyword']}] " + render([h]) + f"\n    {h.get('permalink', '')}", flush=True)
+        time.sleep(args.interval)
+
+
+# ------------------------------------------------------------------- parser
+
+GLOBAL_DEFAULTS = {"json": False, "debug": False, "timeout": 20, "workspace": None}
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="stable JSON envelope on stdout")
+    common.add_argument("--workspace", "-w", default=argparse.SUPPRESS,
+                        help="team id or name (needed when slk has several)")
+    common.add_argument("--debug", action="store_true", default=argparse.SUPPRESS)
+    common.add_argument("--timeout", type=int, default=argparse.SUPPRESS)
+
+    p = argparse.ArgumentParser(prog="slak", parents=[common],
+                                description="Slack from the shell, as yourself (auth via slk).")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, help):
+        sp = sub.add_parser(name, parents=[common], help=help)
+        sp.set_defaults(fn=fn)
+        return sp
+
+    sp = add("login", cmd_login, "take the session from the Slack desktop app (no token pasting)")
+    sp.add_argument("domain", nargs="*", help="workspace subdomain(s); default: every one signed in")
+    add("whoami", cmd_whoami, "show the signed-in user and workspace")
+    sp = add("channels", cmd_channels, "list conversations you are in")
+    sp.add_argument("filter", nargs="?", help="substring filter on name")
+    add("unread", cmd_unread, "conversations with unread messages / mentions")
+    sp = add("read", cmd_read, "recent messages in a channel, DM (@user) or permalink")
+    sp.add_argument("channel")
+    sp.add_argument("--limit", "-n", type=int, default=30)
+    sp = add("thread", cmd_thread, "a whole thread, by permalink or <channel> <ts>")
+    sp.add_argument("ref")
+    sp.add_argument("ts", nargs="?")
+    sp = add("search", cmd_search, "search messages (Slack search syntax, newest first)")
+    sp.add_argument("query")
+    sp.add_argument("--limit", "-n", type=int, default=20)
+    sp = add("send", cmd_send, "post a message as you (#channel, @user for DM, or permalink)")
+    sp.add_argument("channel")
+    sp.add_argument("text", help="message text, or - to read stdin")
+    sp.add_argument("--thread", "-t", help="reply in thread: ts or permalink")
+    sp = add("users", cmd_users, "find people (cached; --refresh to reload)")
+    sp.add_argument("query", nargs="?")
+    sp.add_argument("--refresh", action="store_true")
+    sp = add("watch", cmd_watch, "report new messages containing keywords, across all channels")
+    sp.add_argument("--keyword", "-k", action="append",
+                    help=f"repeatable; default: {' '.join(DEFAULT_WATCH)}")
+    sp.add_argument("--since", type=float, default=1, help="look-back window in days (default 1)")
+    sp.add_argument("--interval", type=int, default=300, help="seconds between polls (default 300)")
+    sp.add_argument("--once", action="store_true", help="single pass, for cron/systemd timers")
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    for key, default in GLOBAL_DEFAULTS.items():
+        if not hasattr(args, key):
+            setattr(args, key, default)
+    try:
+        client = None if args.fn is cmd_login else \
+            Client(load_token(args.workspace), debug=args.debug, timeout=args.timeout)
+        rc = args.fn(args, client)
+        return rc if isinstance(rc, int) else EX_OK
+    except Fail as exc:
+        if args.json:
+            print(json.dumps({"ok": False, "error": {"message": exc.msg, "code": exc.code,
+                                                     "detail": exc.detail}},
+                             ensure_ascii=False, indent=2))
+        else:
+            print(f"error: {exc.msg}", file=sys.stderr)
+            if exc.detail and args.debug:
+                print(json.dumps(exc.detail, ensure_ascii=False, indent=2), file=sys.stderr)
+        return exc.code
+    except KeyboardInterrupt:
+        return EX_OK
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `slak ... | head` exits quietly
+    sys.exit(main())
